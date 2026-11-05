@@ -1,5 +1,5 @@
 import os, json, urllib.request, urllib.error
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -61,7 +61,6 @@ button.send-btn{background:var(--gd);color:#fff;border:none;padding:12px 24px;bo
     <div class="ht" id="tabTitle">ARGON चैट (Architected by Kaushik Raj)</div>
   </div>
   <div class="ct">
-    <!-- CHAT VIEW -->
     <div class="vw active" id="vw-chat" style="padding:0;">
       <div class="cs" id="chatArea" style="padding:20px;">
         <div class="mr ai"><div class="mbb">नमस्ते! मैं ARGON AI हूँ (Architected by Kaushik Raj)। आप मुझसे कोई भी सवाल पूछ सकते हैं!</div></div>
@@ -72,18 +71,16 @@ button.send-btn{background:var(--gd);color:#fff;border:none;padding:12px 24px;bo
       </div>
     </div>
 
-    <!-- IMAGE VIEW -->
     <div class="vw" id="vw-image">
       <h3>🎨 AI इमेज स्टूडियो</h3>
-      <textarea id="imgPrompt" rows="3" style="margin-top:10px;" placeholder="कैसी तस्वीर चाहिए? लिखें (उदा: Cyberpunk warrior neon lighting)"></textarea>
+      <textarea id="imgPrompt" rows="3" style="margin-top:10px;" placeholder="कैसी तस्वीर चाहिए? लिखें..."></textarea>
       <button class="send-btn" style="margin-top:10px;align-self:flex-start;" onclick="genImg()">✨ इमेज बनाएं</button>
       <div id="imgOut" style="margin-top:20px;display:flex;justify-content:center;"></div>
     </div>
 
-    <!-- MOVIE VIEW -->
     <div class="vw" id="vw-movie">
-      <h3>🎬 मूवी फैक्ट्री (Visual Storyboard + Voice Player)</h3>
-      <textarea id="movieTopic" rows="2" style="margin-top:10px;" placeholder="मूवी का विषय लिखें (उदा: Alien attack on Earth 2050)..."></textarea>
+      <h3>🎬 मूवी फैक्ट्री</h3>
+      <textarea id="movieTopic" rows="2" style="margin-top:10px;" placeholder="मूवी का विषय लिखें..."></textarea>
       <button class="send-btn" style="margin-top:10px;align-self:flex-start;" onclick="genMovie()">🎬 मूवी तैयार करें</button>
       
       <div id="videoContainer" style="display:none;margin-top:15px;">
@@ -96,7 +93,6 @@ button.send-btn{background:var(--gd);color:#fff;border:none;padding:12px 24px;bo
       <div id="movieScriptOut" class="movie-box" style="display:none;"></div>
     </div>
 
-    <!-- VOICE VIEW -->
     <div class="vw" id="vw-voice" style="text-align:center;">
       <div class="vo" id="voiceOrb" onclick="toggleVoice()">🎙️</div>
       <h3 id="voiceStatus">माइक पर क्लिक करें और बोलें</h3>
@@ -181,7 +177,7 @@ async function genMovie(){
 
   vCont.style.display='block';
   scrOut.style.display='none';
-  prog.innerText = "⏳ स्टेप 1/3: AI 3-सीन विज़ुअल स्टोरीबोर्ड तैयार कर रहा है...";
+  prog.innerText = "⏳ स्टेप 1/3: AI स्टोरीबोर्ड तैयार कर रहा है...";
   sub.innerText = "कहानी तैयार हो रही है...";
 
   try {
@@ -214,7 +210,7 @@ async function genMovie(){
     }
 
     prog.innerText = "✅ मूवी समाप्त!";
-    sub.innerText = "मूवी पूरी हुई। आप नीचे पूरी पटकथा भी पढ़ सकते हैं।";
+    sub.innerText = "मूवी पूरी हुई।";
     scrOut.style.display='block';
     scrOut.innerHTML = `<h4>पूरी मूवी पटकथा:</h4>` + scenes.map((s, idx)=>`<p style="margin-top:10px;"><b>सीन ${idx+1}:</b> ${s.narration}</p>`).join("");
 
@@ -260,16 +256,26 @@ def call_gemini_backend(prompt: str) -> str:
     if not key:
         return "GEMINI_API_KEY सेट नहीं है।"
     
-    # 2026 के एक्टिव मॉडल्स (v1 एंडपॉइंट के साथ)
-    models = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-2.5-pro"]
+    models = ["gemini-2.5-flash", "gemini-2.0-flash"]
     last_err = ""
+    
+    # यह दोनों तरीके ऑटोमैटिकली ट्राई करेगा:
+    # 1. अगर की AQ. वाली है, तो Bearer Authorization हेडर भेजेगा
+    # 2. अगर की AIzaSy वाली है, तो URL क्वेरी पैरामीटर भेजेगा
     for m in models:
-        url = f"https://generativelanguage.googleapis.com/v1/models/{m}:generateContent?key={key}"
         payload = {
             "contents": [{"parts": [{"text": prompt}]}]
         }
         data = json.dumps(payload).encode("utf-8")
-        req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+        
+        headers = {"Content-Type": "application/json"}
+        if key.startswith("AQ."):
+            url = f"https://generativelanguage.googleapis.com/v1/models/{m}:generateContent"
+            headers["Authorization"] = f"Bearer {key}"
+        else:
+            url = f"https://generativelanguage.googleapis.com/v1/models/{m}:generateContent?key={key}"
+        
+        req = urllib.request.Request(url, data=data, headers=headers)
         try:
             with urllib.request.urlopen(req, timeout=20) as resp:
                 res = json.loads(resp.read().decode("utf-8"))
@@ -281,6 +287,7 @@ def call_gemini_backend(prompt: str) -> str:
         except Exception as e:
             last_err = str(e)
             continue
+            
     return f"AI सर्वर त्रुटि: {last_err}"
 
 @app.get("/", response_class=HTMLResponse)
@@ -291,3 +298,4 @@ async def home():
 async def chat_api(req: ChatReq):
     ans = call_gemini_backend(req.message)
     return {"answer": ans}
+    
