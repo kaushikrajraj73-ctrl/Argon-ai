@@ -4,9 +4,6 @@ from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-# Render के Environment Variable से Key उठाएगा
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-
 app = FastAPI(title="ARGON AI V7000")
 app.add_middleware(
     CORSMiddleware,
@@ -261,20 +258,20 @@ class ChatReq(BaseModel):
 def call_gemini_backend(prompt: str) -> str:
     key = os.getenv("GEMINI_API_KEY", "").strip()
     if not key:
-        return "GEMINI_API_KEY सेट नहीं है। कृपया Render के Environment Variables में GEMINI_API_KEY जोड़ें।"
+        return "GEMINI_API_KEY सेट नहीं है।"
     
-    models = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
+    # 2026 के एक्टिव मॉडल्स (v1 एंडपॉइंट के साथ)
+    models = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-2.5-pro"]
     last_err = ""
     for m in models:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent?key={key}"
+        url = f"https://generativelanguage.googleapis.com/v1/models/{m}:generateContent?key={key}"
         payload = {
-            "contents": [{"parts": [{"text": prompt}]}],
-            "systemInstruction": {"parts": [{"text": "You are ARGON AI, created by Kaushik Raj. Answer directly, helpfully, and clearly in Hindi/Hinglish."}]}
+            "contents": [{"parts": [{"text": prompt}]}]
         }
         data = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
         try:
-            with urllib.request.urlopen(req, timeout=25) as resp:
+            with urllib.request.urlopen(req, timeout=20) as resp:
                 res = json.loads(resp.read().decode("utf-8"))
                 return res["candidates"][0]["content"]["parts"][0]["text"]
         except urllib.error.HTTPError as e:
@@ -284,7 +281,7 @@ def call_gemini_backend(prompt: str) -> str:
         except Exception as e:
             last_err = str(e)
             continue
-    return f"AI सर्वर से उत्तर नहीं मिला। त्रुटि विवरण: {last_err}"
+    return f"AI सर्वर त्रुटि: {last_err}"
 
 @app.get("/", response_class=HTMLResponse)
 async def home():
