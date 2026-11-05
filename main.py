@@ -8,19 +8,18 @@ from botocore.client import Config as BotoConfig
 from fastapi import FastAPI, Request, Response, Depends, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from google import genai
 from google.genai import types
 from google.oauth2 import id_token
 from google.auth.transport import requests as google_requests
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
-from sqlalchemy import String, Float, Text, Integer, select, update, delete
+from sqlalchemy import String, Float, Text, Integer, select, update
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("ARGON")
 
-# ============ CONFIG ============
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
 JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "argon-ai-secret-key-change-it-32-chars")
@@ -32,12 +31,10 @@ R2_BUCKET_NAME = os.getenv("R2_BUCKET_NAME", "argon-media")
 COOKIE_SECURE = os.getenv("COOKIE_SECURE", "false").lower() == "true"
 ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "*").split(",")]
 
-# ✅ आपके बताए नए मॉडल्स (3.8)
 CHAT_MODEL  = os.getenv("CHAT_MODEL",  "gemini-3.8-flash")
 LIVE_MODEL  = os.getenv("LIVE_MODEL",  "gemini-3.8-live")
 IMAGE_MODEL = os.getenv("IMAGE_MODEL", "imagen-3.0-generate-001")
 
-# ✅ बैकअप मॉडल्स (अगर 3.8 काम न करे तो)
 FALLBACK_CHAT = "gemini-2.0-flash"
 FALLBACK_LIVE = "gemini-2.0-flash-exp"
 
@@ -47,7 +44,6 @@ JWT_LIFETIME = 86400
 if not GEMINI_API_KEY: raise RuntimeError("GEMINI_API_KEY missing")
 if not DATABASE_URL: raise RuntimeError("DATABASE_URL missing")
 
-# ============ DATABASE ============
 engine = create_async_engine(DATABASE_URL, pool_pre_ping=True)
 AsyncSessionLocal = async_sessionmaker(engine, expire_on_commit=False)
 class Base(DeclarativeBase): pass
@@ -103,7 +99,6 @@ class MovieJob(Base):
 async def get_db():
     async with AsyncSessionLocal() as session: yield session
 
-# ============ STORAGE ============
 def get_s3():
     return boto3.client("s3", endpoint_url=R2_ENDPOINT_URL, aws_access_key_id=R2_ACCESS_KEY_ID, aws_secret_access_key=R2_SECRET_ACCESS_KEY, config=BotoConfig(signature_version="s3v4"), region_name="auto")
 
@@ -114,7 +109,6 @@ def upload_file(filepath, key, content_type="application/octet-stream"):
 def presigned_url(key, expires_in=3600):
     return get_s3().generate_presigned_url("get_object", Params={"Bucket": R2_BUCKET_NAME, "Key": key}, ExpiresIn=expires_in)
 
-# ============ AUTH ============
 def make_jwt(user_id):
     now = int(time.time())
     return jwt.encode({"sub": user_id, "jti": str(uuid.uuid4()), "iat": now, "exp": now + JWT_LIFETIME}, JWT_SECRET_KEY, algorithm=JWT_ALGORITHM)
@@ -131,28 +125,23 @@ async def current_user(request: Request, db: AsyncSession = Depends(get_db)):
     if not token: raise HTTPException(401, "Login required")
     return await verify_jwt(token, db)
 
-# ============ AI LOGIC (Fallback System) ============
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
 async def gemini_chat_stream(history, message):
     contents = [{"role": "user" if i["role"]=="user" else "model", "parts":[{"text": i["content"]}]} for i in history]
     contents.append({"role": "user", "parts": [{"text": message}]})
-    
-    # ✅ Fallback System: पहले 3.8 ट्राई करेगा, फेल होने पर 2.0
     for model in [CHAT_MODEL, FALLBACK_CHAT]:
         try:
             response = await gemini_client.aio.models.generate_content_stream(
                 model=model, contents=contents,
-                config=types.GenerateContentConfig(
-                    system_instruction="You are ARGON AI.", 
-                    tools=[types.Tool(google_search=types.GoogleSearch())]))
+                config=types.GenerateContentConfig(system_instruction="You are ARGON AI.", tools=[types.Tool(google_search=types.GoogleSearch())]))
             async for chunk in response:
                 if chunk.text: yield chunk.text
-            return # सफल होने पर बाहर निकल जाओ
+            return
         except Exception as e:
             log.warning(f"Model {model} failed: {e}. Trying fallback...")
-            if model == FALLBACK_CHAT: # अगर बैकअप भी फेल हो जाए
-                yield "\n\n⚠️ AI सर्वर से कनेक्ट नहीं हो पा रहा है। कृपया API Key और मॉडल एक्सेस चेक करें।"
+            if model == FALLBACK_CHAT:
+                yield "\n\n⚠️ AI सर्वर से कनेक्ट नहीं हो पा रहा है।"
 
 async def gemini_image_bytes(prompt):
     try:
@@ -161,7 +150,7 @@ async def gemini_image_bytes(prompt):
         raise RuntimeError("No image")
     except Exception as e:
         log.error(f"Image Error: {e}")
-        raise HTTPException(500, "Image generation failed. API key or model issue.")
+        raise HTTPException(500, "Image generation failed.")
 
 async def synthesize_voice(text):
     c = edge_tts.Communicate(text, "hi-IN-MadhurNeural"); buf = b""
@@ -181,7 +170,6 @@ def srt_timestamp(seconds):
     ms = round(seconds * 1000); h, ms = divmod(ms, 3600000); m, ms = divmod(ms, 60000); s, ms = divmod(ms, 1000)
     return f"{h:02}:{m:02}:{s:02},{ms:03}"
 
-# ============ MOVIE FACTORY ============
 async def run_movie_job(job_id, user_id, topic):
     async with AsyncSessionLocal() as db:
         await db.execute(update(MovieJob).where(MovieJob.job_id == job_id).values(status="processing", progress=10, message="Starting..."))
@@ -190,15 +178,12 @@ async def run_movie_job(job_id, user_id, topic):
     tmpdir = tempfile.mkdtemp()
     try:
         prompt = f'Create Hindi script about: {topic}. Return JSON: {{"scenes":[{{"text":"...","image_desc":"..."}}]}}. Exactly 3 scenes.'
-        
-        # ✅ Fallback System for Movie
         res = None
         for model in [CHAT_MODEL, FALLBACK_CHAT]:
             try:
                 res = await gemini_client.aio.models.generate_content(model=model, contents=prompt, config=types.GenerateContentConfig(response_mime_type="application/json"))
                 break
-            except Exception as e:
-                log.warning(f"Movie model {model} failed: {e}")
+            except Exception as e: log.warning(f"Movie model {model} failed: {e}")
                 
         if not res: raise RuntimeError("All models failed")
         
@@ -244,11 +229,10 @@ async def run_movie_job(job_id, user_id, topic):
     except Exception as ex:
         log.error(f"Movie err: {ex}")
         async with AsyncSessionLocal() as db:
-            await db.execute(update(MovieJob).where(MovieJob.job_id == job_id).values(status="failed", error="Video generation failed. Server error."))
+            await db.execute(update(MovieJob).where(MovieJob.job_id == job_id).values(status="failed", error="Video generation failed."))
             await db.commit()
     finally: shutil.rmtree(tmpdir, ignore_errors=True)
 
-# ============ APP SETUP ============
 @asynccontextmanager
 async def lifespan(app):
     async with engine.begin() as conn: await conn.run_sync(Base.metadata.create_all)
@@ -258,12 +242,6 @@ async def lifespan(app):
 app = FastAPI(lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=ALLOWED_ORIGINS, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
-@app.exception_handler(Exception)
-async def global_exception_handler(request: Request, exc: Exception):
-    log.error(f"Global Error: {exc}")
-    return JSONResponse(status_code=500, content={"detail": str(exc)})
-
-# ============ ROUTES ============
 class GoogleLogin(BaseModel): credential: str
 class ChatInput(BaseModel): message: str; session_id: str
 class ImageInput(BaseModel): prompt: str
@@ -272,9 +250,7 @@ class MovieInput(BaseModel): topic: str
 @app.post("/auth/google")
 async def auth_google(data: GoogleLogin, response: Response, db: AsyncSession = Depends(get_db)):
     try: idinfo = id_token.verify_oauth2_token(data.credential, google_requests.Request(), GOOGLE_CLIENT_ID)
-    except Exception as e: 
-        log.error(f"Login Error: {e}")
-        raise HTTPException(401, "Invalid token")
+    except: raise HTTPException(401, "Invalid token")
     email = idinfo["email"]; user_id = idinfo["sub"]
     res = await db.execute(select(User).where(User.email == email))
     user = res.scalar_one_or_none()
@@ -356,19 +332,14 @@ async def ws_voice(ws: WebSocket):
     token = ws.cookies.get("argon_session")
     if not token: await ws.close(code=1008); return
     await ws.accept()
-    
-    # ✅ Fallback for Live Voice
     cfg = types.LiveConnectConfig(response_modalities=["AUDIO"])
     session = None
     for model in [LIVE_MODEL, FALLBACK_LIVE]:
         try:
             session = await gemini_client.aio.live.connect(model=model, config=cfg).__aenter__()
             break
-        except Exception as e:
-            log.warning(f"Live model {model} failed: {e}")
-    
-    if not session:
-        await ws.close(code=1008); return
+        except Exception as e: log.warning(f"Live model {model} failed: {e}")
+    if not session: await ws.close(code=1008); return
 
     try:
         async def b2g():
@@ -387,11 +358,10 @@ async def ws_voice(ws: WebSocket):
         await asyncio.wait(t, return_when=asyncio.FIRST_COMPLETED)
         for x in t: x.cancel()
     except Exception: pass
-    finally: 
+    finally:
         await session.__aexit__(None, None, None)
-        await ws.close()
+        await ws.close;
 
-# ============ FRONTEND HTML ============
 INDEX_HTML = """
 <!DOCTYPE html><html lang="hi"><head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -403,4 +373,190 @@ INDEX_HTML = """
 :root{--bg:#0a0b10;--bg2:#12141c;--bg3:#1a1d28;--tx:#e8eaf0;--tx2:#8b8fa3;--gd:linear-gradient(135deg,#7c9cff,#a855f7)}
 *{box-sizing:border-box;margin:0;padding:0}body{font-family:system-ui;background:var(--bg);color:var(--tx);display:flex;height:100vh;overflow:hidden}
 .sb{width:260px;background:var(--bg2);border-right:1px solid #252936;padding:16px;display:flex;flex-direction:column}
-.nc{width:100%;padding:12px;border-radius:12px;background:va
+.nc{width:100%;padding:12px;border-radius:12px;background:var(--bg3);color:var(--tx);border:none;cursor:pointer;font-weight:bold;margin-bottom:20px}
+.ni{display:block;width:100%;text-align:left;padding:10px;color:var(--tx2);border:none;background:none;cursor:pointer;margin-top:5px;border-radius:8px}
+.ni:hover,.ni.active{background:var(--bg3);color:var(--tx)}
+.mn{flex:1;display:flex;flex-direction:column}
+.hd{padding:20px;border-bottom:1px solid #252936;font-weight:bold;font-size:18px}
+.cs{flex:1;overflow-y:auto;padding:20px}
+.mr{display:flex;margin-bottom:15px;gap:10px;animation:fi .3s}.mr.user{flex-direction:row-reverse}
+@keyframes fi{from{opacity:0}}
+.ma{width:32px;height:32px;border-radius:50%;background:var(--gd);display:flex;align-items:center;justify-content:center;color:#fff;font-size:13px;flex-shrink:0}
+.mbb{padding:12px 16px;border-radius:16px;background:var(--bg3);max-width:80%;line-height:1.5;overflow-x:auto}
+.mbb pre{background:#000;padding:10px;border-radius:8px}
+.cw{padding:20px}
+.cb{display:flex;background:var(--bg2);padding:10px;border-radius:12px;border:1px solid #252936}
+.cb textarea{flex:1;background:none;border:none;color:var(--tx);outline:none;resize:none;font-size:15px}
+.sd{background:var(--gd);color:#fff;border:none;padding:10px 15px;border-radius:8px;cursor:pointer;font-weight:bold}
+.ao{position:fixed;inset:0;background:rgba(0,0,0,0.9);display:flex;align-items:center;justify-content:center;z-index:100}
+.ao.hide{display:none}.ac2{background:var(--bg2);padding:40px;border-radius:20px;text-align:center}
+.vv{display:flex;flex-direction:column;align-items:center;justify-content:center;height:100%}
+.vo{width:120px;height:120px;border-radius:50%;background:var(--gd);display:flex;align-items:center;justify-content:center;font-size:40px;margin-bottom:20px}
+</style></head><body>
+
+<aside class="sb">
+  <div style="font-size:20px;font-weight:800;margin-bottom:20px;">ARGON AI</div>
+  <button class="nc" onclick="newChat()">+ नई बातचीत</button>
+  <button class="ni active" onclick="switchView('chat')">💬 चैट</button>
+  <button class="ni" onclick="switchView('movie')">🎬 मूवी</button>
+  <button class="ni" onclick="switchView('voice')">🎙️ वॉइस</button>
+  <div style="margin-top:30px;font-size:12px;color:var(--tx2)">हाल की बातें</div>
+  <div id="sessionsList" style="flex:1;overflow-y:auto;font-size:13px;margin-top:10px"></div>
+</aside>
+
+<div class="mn">
+  <div class="hd" id="ht">चैट</div>
+  <div class="cs" id="cs"><div id="ci"></div></div>
+  <div class="cw" id="chatArea"><div class="cb">
+    <textarea id="chatInput" rows="1" placeholder="संदेश लिखें..."></textarea>
+    <button class="sd" onclick="sendChat()">➤</button>
+  </div></div>
+  <div class="cw" id="movieArea" style="display:none">
+    <div class="cb">
+      <textarea id="movieTopic" rows="1" placeholder="मूवी का विषय लिखें..."></textarea>
+      <button class="sd" onclick="startMovie()">बनाएं</button>
+    </div>
+    <div id="movieStatus" style="margin-top:10px;font-size:14px;color:var(--tx2)"></div>
+  </div>
+  <div class="vv" id="voiceArea" style="display:none">
+    <div class="vo">🎤</div>
+    <button class="sd" onclick="toggleVoice()" id="voiceBtn">Start Voice</button>
+  </div>
+</div>
+
+<div class="ao" id="ao">
+  <div class="ac2">
+    <h2>Welcome to ARGON AI</h2>
+    <p style="margin:20px 0;color:var(--tx2)">जारी रखने के लिए लॉगिन करें</p>
+    <div id="g_id_onload" data-client_id="__GOOGLE_CLIENT_ID__" data-callback="handleCredentialResponse"></div>
+    <div class="g_id_signin" data-type="standard" data-theme="filled_black" data-size="large" data-shape="pill"></div>
+  </div>
+</div>
+
+<script>
+let currentSessionId = "", isSending = false;
+document.addEventListener('DOMContentLoaded', () => {
+    fetch('/api/me').then(r => { if(r.ok) { hideAuth(); loadSessions(); } else showAuth(); }).catch(showAuth);
+});
+function showAuth(){document.getElementById('ao').classList.remove('hide')}
+function hideAuth(){document.getElementById('ao').classList.add('hide')}
+function handleCredentialResponse(r){fetch('/auth/google',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({credential:r.credential})}).then(x=>x.json()).then(d=>{if(d.success){hideAuth();loadSessions();}else alert('Login Failed')})}
+function switchView(v) {
+    document.getElementById('chatArea').style.display='none';
+    document.getElementById('movieArea').style.display='none';
+    document.getElementById('voiceArea').style.display='none';
+    document.getElementById('cs').style.display='none';
+    if(v === 'chat') { document.getElementById('chatArea').style.display='block'; document.getElementById('cs').style.display='block'; document.getElementById('ht').innerText='चैट'; }
+    if(v === 'movie') { document.getElementById('movieArea').style.display='block'; document.getElementById('ht').innerText='मूवी फैक्ट्री'; }
+    if(v === 'voice') { document.getElementById('voiceArea').style.display='flex'; document.getElementById('ht').innerText='लाइव वॉइस'; }
+}
+async function loadSessions() {
+    const r = await fetch('/api/chat/sessions'); const d = await r.json();
+    const list = document.getElementById('sessionsList'); list.innerHTML = '';
+    if(d.sessions.length === 0) return newChat();
+    d.sessions.forEach(s => {
+        const div = document.createElement('div'); div.className = 'ni'; div.innerText = s.title;
+        div.onclick = () => { currentSessionId = s.id; loadHistory(); };
+        list.appendChild(div);
+        if(!currentSessionId) { currentSessionId = s.id; loadHistory(); }
+    });
+}
+async function newChat() {
+    const r = await fetch('/api/chat/session', {method: 'POST'}); const d = await r.json();
+    currentSessionId = d.session_id; document.getElementById('ci').innerHTML = ''; loadSessions();
+}
+async function loadHistory() {
+    const r = await fetch('/api/chat/history/' + currentSessionId); const d = await r.json();
+    const c = document.getElementById('ci'); c.innerHTML = '';
+    d.history.forEach(h => {
+        const div = document.createElement('div'); div.className = 'mr ' + (h.role === 'user' ? 'user' : 'ai');
+        div.innerHTML = `<div class="ma">${h.role === 'user' ? 'U' : 'A'}</div><div class="mbb">${h.role==='model'?DOMPurify.sanitize(marked.parse(h.content)):h.content}</div>`;
+        c.appendChild(div);
+    });
+    document.getElementById('cs').scrollTop = document.getElementById('cs').scrollHeight;
+}
+async function sendChat() {
+    if(isSending || !currentSessionId) return;
+    const input = document.getElementById('chatInput'), msg = input.value.trim();
+    if(!msg) return; isSending = true; input.value = '';
+    const c = document.getElementById('ci');
+    c.innerHTML += `<div class="mr user"><div class="ma">U</div><div class="mbb">${msg}</div></div>`;
+    const aiDiv = document.createElement('div'); aiDiv.className = 'mr ai';
+    aiDiv.innerHTML = `<div class="ma">A</div><div class="mbb" id="aiBubble">...</div>`;
+    c.appendChild(aiDiv); document.getElementById('cs').scrollTop = document.getElementById('cs').scrollHeight;
+    try {
+        const res = await fetch('/api/chat', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:msg, session_id:currentSessionId})});
+        if(!res.ok) throw new Error('Server Error ' + res.status);
+        const reader = res.body.getReader(); const decoder = new TextDecoder();
+        let fullText = "", buffer = "";
+        while(true) {
+            const {done, value} = await reader.read(); if(done) break;
+            buffer += decoder.decode(value, {stream:true});
+            let lines = buffer.split('\n\n'); buffer = lines.pop();
+            for(let line of lines) {
+                if(line.startsWith('data: ')) {
+                    try {
+                        const data = JSON.parse(line.substring(6));
+                        if(data.error) throw new Error(data.error);
+                        if(data.text) {
+                            fullText += data.text;
+                            document.getElementById('aiBubble').innerHTML = DOMPurify.sanitize(marked.parse(fullText));
+                            document.getElementById('cs').scrollTop = document.getElementById('cs').scrollHeight;
+                        }
+                    } catch(e) {}
+                }
+            }
+        }
+    } catch(e) { document.getElementById('aiBubble').innerText = "❌ " + e.message; }
+    isSending = false;
+}
+async function startMovie() {
+    const topic = document.getElementById('movieTopic').value.trim(); if(!topic) return;
+    document.getElementById('movieStatus').innerText = "⏳ शुरू हो रहा है...";
+    const r = await fetch('/api/movie/start', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({topic})});
+    if(!r.ok) { document.getElementById('movieStatus').innerText = "❌ API Error"; return; }
+    const d = await r.json();
+    const timer = setInterval(async () => {
+        const s = await (await fetch('/api/movie/status/' + d.job_id)).json();
+        document.getElementById('movieStatus').innerText = `${s.message || s.status} (${s.progress}%)`;
+        if(s.status === 'completed') {
+            clearInterval(timer);
+            const url = await (await fetch('/media/' + s.filename)).json();
+            document.getElementById('movieStatus').innerHTML = `<br><video src="${url.url}" controls width="100%"></video>`;
+        }
+        if(s.status === 'failed') { clearInterval(timer); document.getElementById('movieStatus').innerText = "❌ " + s.error; }
+    }, 3000);
+}
+let ws, audioCtx, isVoice = false;
+function toggleVoice() {
+    if(isVoice) { isVoice = false; ws.close(); audioCtx.close(); document.getElementById('voiceBtn').innerText = 'Start Voice'; return; }
+    const protocol = location.protocol === "https:" ? "wss:" : "ws:";
+    ws = new WebSocket(`${protocol}//${location.host}/ws/voice`);
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    ws.onopen = async () => {
+        isVoice = true; document.getElementById('voiceBtn').innerText = 'Stop Voice';
+        const stream = await navigator.mediaDevices.getUserMedia({audio: true});
+        const source = audioCtx.createMediaStreamSource(stream);
+        const processor = audioCtx.createScriptProcessor(512, 1, 1);
+        processor.onaudioprocess = (e) => {
+            if(!isVoice) return;
+            const input = e.inputBuffer.getChannelData(0);
+            const pcm16 = new Int16Array(input.length);
+            for(let i=0; i<input.length; i++) { let x = Math.max(-1, Math.min(1, input[i])); pcm16[i] = x < 0 ? x * 0x8000 : x * 0x7FFF; }
+            ws.send(JSON.stringify({type: 'audio', data: btoa(String.fromCharCode(...new Uint8Array(pcm16.buffer)))}));
+        };
+        source.connect(processor); processor.connect(audioCtx.destination);
+    };
+    ws.onmessage = (e) => {
+        const m = JSON.parse(e.data);
+        if(m.type === 'audio') {
+            const raw = atob(m.data), arr = new Uint8Array(raw.length);
+            for(let i=0; i<raw.length; i++) arr[i] = raw.charCodeAt(i);
+            const buf = audioCtx.createBuffer(1, arr.length/2, 24000), d = buf.getChannelData(0), v = new DataView(arr.buffer);
+            for(let i=0; i<d.length; i++) d[i] = v.getInt16(i*2, true) / 32768;
+            const src = audioCtx.createBufferSource(); src.buffer = buf; src.connect(audioCtx.destination); src.start();
+        }
+    };
+}
+</script></body></html>
+"""
