@@ -1,7 +1,11 @@
-import os
-from fastapi import FastAPI
+import os, json, urllib.request, urllib.error
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+
+# Render के Environment Variable से Key उठाएगा
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
 app = FastAPI(title="ARGON AI V7000")
 app.add_middleware(
@@ -44,11 +48,9 @@ button.send-btn{background:var(--gd);color:#fff;border:none;padding:12px 24px;bo
 .vo.recording{animation:pulse 1.2s infinite;background:#ff0055}
 @keyframes pulse{0%{box-shadow:0 0 0 0 rgba(255,0,85,0.7)}70%{box-shadow:0 0 0 25px rgba(255,0,85,0)}100%{box-shadow:0 0 0 0 rgba(255,0,85,0)}}
 .movie-box{background:var(--bg-2);border:1px solid var(--bd);padding:20px;border-radius:12px;margin-top:15px;line-height:1.6}
-.api-bar{display:flex;align-items:center;gap:10px}
-.api-bar input{padding:6px 12px;font-size:12px;width:240px;background:#050510}
 .video-screen{width:100%;max-width:640px;height:360px;background:#000;border:2px solid var(--ac);border-radius:10px;position:relative;overflow:hidden;margin:15px auto;display:flex;align-items:center;justify-content:center}
 .video-screen img{width:100%;height:100%;object-fit:cover}
-.subtitles{position:absolute;bottom:15px;left:10px;right:10px;background:rgba(0,0,0,0.8);color:#fff;padding:8px 12px;border-radius:6px;font-size:14px;text-align:center}
+.subtitles{position:absolute;bottom:15px;left:10px;right:10px;background:rgba(0,0,0,0.85);color:#fff;padding:8px 12px;border-radius:6px;font-size:14px;text-align:center}
 </style></head><body>
 <aside class="sb">
   <div class="lg">ARGON AI V7000</div>
@@ -60,16 +62,12 @@ button.send-btn{background:var(--gd);color:#fff;border:none;padding:12px 24px;bo
 <div class="mn">
   <div class="hd">
     <div class="ht" id="tabTitle">ARGON चैट (Architected by Kaushik Raj)</div>
-    <div class="api-bar">
-      <span style="font-size:12px;color:var(--tx2);">Gemini API Key:</span>
-      <input type="password" id="clientApiKey" placeholder="API Key यहाँ डालें..." onchange="localStorage.setItem('argon_key', this.value)">
-    </div>
   </div>
   <div class="ct">
     <!-- CHAT VIEW -->
     <div class="vw active" id="vw-chat" style="padding:0;">
       <div class="cs" id="chatArea" style="padding:20px;">
-        <div class="mr ai"><div class="mbb">नमस्ते! मैं ARGON AI हूँ। ऊपर अपनी Gemini API Key डालकर कुछ भी पूछें।</div></div>
+        <div class="mr ai"><div class="mbb">नमस्ते! मैं ARGON AI हूँ (Architected by Kaushik Raj)। आप मुझसे कोई भी सवाल पूछ सकते हैं!</div></div>
       </div>
       <div class="cw">
         <input type="text" id="chatInput" placeholder="संदेश लिखें..." onkeydown="if(event.key==='Enter')sendChat()">
@@ -80,7 +78,7 @@ button.send-btn{background:var(--gd);color:#fff;border:none;padding:12px 24px;bo
     <!-- IMAGE VIEW -->
     <div class="vw" id="vw-image">
       <h3>🎨 AI इमेज स्टूडियो</h3>
-      <textarea id="imgPrompt" rows="3" style="margin-top:10px;" placeholder="कैसी तस्वीर चाहिए? प्रॉम्प्ट लिखें (उदा: Cyberpunk neon warrior)"></textarea>
+      <textarea id="imgPrompt" rows="3" style="margin-top:10px;" placeholder="कैसी तस्वीर चाहिए? लिखें (उदा: Cyberpunk warrior neon lighting)"></textarea>
       <button class="send-btn" style="margin-top:10px;align-self:flex-start;" onclick="genImg()">✨ इमेज बनाएं</button>
       <div id="imgOut" style="margin-top:20px;display:flex;justify-content:center;"></div>
     </div>
@@ -88,7 +86,7 @@ button.send-btn{background:var(--gd);color:#fff;border:none;padding:12px 24px;bo
     <!-- MOVIE VIEW -->
     <div class="vw" id="vw-movie">
       <h3>🎬 मूवी फैक्ट्री (Visual Storyboard + Voice Player)</h3>
-      <textarea id="movieTopic" rows="2" style="margin-top:10px;" placeholder="मूवी का विषय लिखें (उदा: Future robot apocalypse)..."></textarea>
+      <textarea id="movieTopic" rows="2" style="margin-top:10px;" placeholder="मूवी का विषय लिखें (उदा: Alien attack on Earth 2050)..."></textarea>
       <button class="send-btn" style="margin-top:10px;align-self:flex-start;" onclick="genMovie()">🎬 मूवी तैयार करें</button>
       
       <div id="videoContainer" style="display:none;margin-top:15px;">
@@ -111,15 +109,6 @@ button.send-btn{background:var(--gd);color:#fff;border:none;padding:12px 24px;bo
 </div>
 
 <script>
-window.onload = () => {
-  const k = localStorage.getItem('argon_key') || "";
-  if(k) document.getElementById('clientApiKey').value = k;
-};
-
-function getApiKey(){
-  return document.getElementById('clientApiKey').value.trim() || localStorage.getItem('argon_key') || "";
-}
-
 function switchTab(t){
   document.querySelectorAll('.vw').forEach(v=>v.classList.remove('active'));
   document.querySelectorAll('.ni').forEach(n=>n.classList.remove('active'));
@@ -129,47 +118,17 @@ function switchTab(t){
   document.getElementById('tabTitle').innerText = titles[t] + " (Architected by Kaushik Raj)";
 }
 
-// कभी 'व्यस्त' न होने वाला स्मार्ट मल्टी-मॉडल फ़ॉलबैक इंजन
-async function callGeminiDirect(promptText){
-  const key = getApiKey();
-  if(!key) throw new Error("कृपया पहले ऊपर दाईं तरफ अपनी Gemini API Key पेस्ट करें!");
-  
-  const models = [
-    "gemini-2.5-flash",
-    "gemini-2.0-flash",
-    "gemini-1.5-flash",
-    "gemini-2.0-flash-lite"
-  ];
-  
-  let lastErr = "";
-  for(let m of models){
-    try{
-      const url = `https://generativelanguage.googleapis.com/v1beta/models/${m}:generateContent?key=${key}`;
-      const res = await fetch(url, {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({
-          contents: [{ parts: [{ text: promptText }] }],
-          systemInstruction: { parts: [{ text: "You are ARGON AI, created by Kaushik Raj. Provide clear, accurate answers directly in user's language." }] }
-        })
-      });
-      
-      const data = await res.json();
-      if(res.status === 200 && data.candidates && data.candidates[0].content.parts[0].text){
-        return data.candidates[0].content.parts[0].text;
-      }
-      
-      // अगर 503 (Busy) या 429 (Rate Limit) आए, तो अगले मॉडल पर बढ़ें
-      if(data.error){
-        lastErr = data.error.message;
-      }
-    }catch(e){
-      lastErr = e.message;
-    }
-    // छोटे पॉज़ के बाद दूसरा मॉडल ट्राई करें
-    await new Promise(r => setTimeout(r, 600));
+async function requestServer(promptText){
+  const res = await fetch('/api/chat', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({message: promptText})
+  });
+  const data = await res.json();
+  if(!res.ok){
+    throw new Error(data.detail || "सर्वर से उत्तर नहीं मिला");
   }
-  throw new Error("AI सर्वर पर अत्यधिक लोड है। 10 सेकंड बाद पुनः प्रयास करें या नई API Key बदलें। विवरण: " + lastErr);
+  return data.answer;
 }
 
 async function sendChat(){
@@ -180,11 +139,11 @@ async function sendChat(){
   box.scrollTop=box.scrollHeight;
   const aiBox=document.createElement('div');
   aiBox.className='mr ai';
-  aiBox.innerHTML=`<div class="mbb">⏳ प्रोसेस हो रहा है...</div>`;
+  aiBox.innerHTML=`<div class="mbb">⏳ ARGON सोच रहा है...</div>`;
   box.appendChild(aiBox);
   box.scrollTop=box.scrollHeight;
   try{
-    const ans = await callGeminiDirect(msg);
+    const ans = await requestServer(msg);
     aiBox.querySelector('.mbb').innerHTML=marked.parse(ans);
   }catch(e){aiBox.querySelector('.mbb').innerText='त्रुटि: '+e.message;}
   box.scrollTop=box.scrollHeight;
@@ -200,7 +159,7 @@ function genImg(){
   img.onload = () => {
     out.innerHTML = `<img src="${imgUrl}" style="max-width:100%;max-height:480px;border-radius:12px;border:1px solid var(--bd);box-shadow:0 0 20px rgba(0,255,204,0.3);">`;
   };
-  img.onerror = () => { out.innerHTML = '<p style="color:#ff5555;">इमेज लोड करने में समस्या आई। पुनः प्रयास करें।</p>'; };
+  img.onerror = () => { out.innerHTML = '<p style="color:#ff5555;">इमेज लोड करने में समस्या आई।</p>'; };
   img.src = imgUrl;
 }
 
@@ -230,7 +189,7 @@ async function genMovie(){
 
   try {
     const prompt = `Write a dramatic 3-scene mini movie script about: "${t}". Output ONLY a valid JSON array of 3 objects with "visual_prompt" (English descriptive image prompt) and "narration" (Hindi dialogue, 2 lines). Example: [{"visual_prompt": "cyberpunk city 2050 neon", "narration": "साल 2050 में शहर बदल चुका था।"}]`;
-    const raw = await callGeminiDirect(prompt);
+    const raw = await requestServer(prompt);
     let scenes;
     try {
       const match = raw.match(/\\[[\\s\\S]*\\]/);
@@ -246,7 +205,7 @@ async function genMovie(){
     prog.innerText = "🎬 स्टेप 2/3: विज़ुअल फ्रेम्स रेंडर हो रहे हैं...";
     for(let i=0; i<scenes.length; i++){
       const cleanP = encodeURIComponent(scenes[i].visual_prompt);
-      scenes[i].imgUrl = `https://image.pollinations.ai/prompt/${cleanP}?width=800&height=450&nologo=true&seed=`+(2000+i);
+      scenes[i].imgUrl = `https://image.pollinations.ai/prompt/${cleanP}?width=800&height=450&nologo=true&seed=`+(3000+i);
     }
 
     prog.innerText = "▶️ स्टेप 3/3: मूवी चल रही है...";
@@ -285,7 +244,7 @@ function toggleVoice(){
     orb.classList.remove('recording');
     isRecording = false;
     try {
-      const ans = await callGeminiDirect("Answer concisely in 1-2 lines in Hindi: " + text);
+      const ans = await requestServer("Answer concisely in 1-2 lines in Hindi: " + text);
       st.innerText = ans;
       await speakTextAsync(ans);
     } catch(err) { st.innerText = "त्रुटि: " + err.message; }
@@ -296,7 +255,42 @@ function toggleVoice(){
 }
 </script></body></html>"""
 
+class ChatReq(BaseModel):
+    message: str
+
+def call_gemini_backend(prompt: str) -> str:
+    key = os.getenv("GEMINI_API_KEY", "").strip()
+    if not key:
+        return "GEMINI_API_KEY सेट नहीं है। कृपया Render के Environment Variables में GEMINI_API_KEY जोड़ें।"
+    
+    models = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
+    last_err = ""
+    for m in models:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent?key={key}"
+        payload = {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "systemInstruction": {"parts": [{"text": "You are ARGON AI, created by Kaushik Raj. Answer directly, helpfully, and clearly in Hindi/Hinglish."}]}
+        }
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=25) as resp:
+                res = json.loads(resp.read().decode("utf-8"))
+                return res["candidates"][0]["content"]["parts"][0]["text"]
+        except urllib.error.HTTPError as e:
+            err_body = e.read().decode("utf-8")
+            last_err = f"HTTP {e.code}: {err_body}"
+            continue
+        except Exception as e:
+            last_err = str(e)
+            continue
+    return f"AI सर्वर से उत्तर नहीं मिला। त्रुटि विवरण: {last_err}"
+
 @app.get("/", response_class=HTMLResponse)
 async def home():
     return INDEX_HTML
-    
+
+@app.post("/api/chat")
+async def chat_api(req: ChatReq):
+    ans = call_gemini_backend(req.message)
+    return {"answer": ans}
