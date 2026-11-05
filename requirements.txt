@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+google-genai
+edge-tts
+pyjwt
+pydantic
+python-dotenv
+google-auth
