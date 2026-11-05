@@ -1,0 +1,298 @@
+import os, json, time, uuid, base64, hashlib, logging, asyncio, tempfile, shutil, subprocess, math, textwrap
+from contextlib import asynccontextmanager
+from collections import defaultdict
+from dotenv import load_dotenv
+load_dotenv()
+
+import jwt, boto3, edge_tts
+from botocore.client import Config as BotoConfig
+from fastapi import FastAPI, Request, Response, Depends, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field, field_validator
+from google import genai
+from google.genai import types
+from google.oauth2 import id_token
+from google.auth.transport import requests as google_requests
+from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from sqlalchemy import String, Float, Text, Integer, select, update, delete as sql_delete
+
+# ============ CONFIG & SECURITY ============
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
+JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "argon_super_secret_jwt_key_32_characters_long")
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./argon.db")
+R2_ENDPOINT_URL = os.getenv("R2_ENDPOINT_URL", "")
+R2_ACCESS_KEY_ID = os.getenv("R2_ACCESS_KEY_ID", "")
+R2_SECRET_ACCESS_KEY = os.getenv("R2_SECRET_ACCESS_KEY", "")
+R2_BUCKET_NAME = os.getenv("R2_BUCKET_NAME", "argon-media")
+
+CHAT_MODEL  = os.getenv("CHAT_MODEL",  "gemini-2.5-flash")
+IMAGE_MODEL = os.getenv("IMAGE_MODEL", "gemini-2.5-flash-image")
+LIVE_MODEL  = os.getenv("LIVE_MODEL",  "gemini-2.0-flash-exp")
+
+JWT_ALGORITHM = "HS256"
+JWT_LIFETIME = 86400
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger("ARGON")
+
+# ============ DATABASE ============
+engine = create_async_engine(DATABASE_URL, pool_pre_ping=True)
+AsyncSessionLocal = async_sessionmaker(engine, expire_on_commit=False)
+
+class Base(DeclarativeBase): pass
+
+class User(Base):
+    __tablename__ = "users"
+    user_id: Mapped[str] = mapped_column(String, primary_key=True)
+    email: Mapped[str] = mapped_column(String, unique=True, index=True)
+    name: Mapped[str] = mapped_column(String, nullable=True)
+    picture: Mapped[str] = mapped_column(String, nullable=True)
+    created_at: Mapped[float] = mapped_column(Float, default=time.time)
+
+class ChatSession(Base):
+    __tablename__ = "chat_sessions"
+    session_id: Mapped[str] = mapped_column(String, primary_key=True)
+    user_id: Mapped[str] = mapped_column(String, index=True)
+    title: Mapped[str] = mapped_column(String, default="New Chat")
+    created_at: Mapped[float] = mapped_column(Float, default=time.time)
+
+class Chat(Base):
+    __tablename__ = "chats"
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    session_id: Mapped[str] = mapped_column(String, index=True)
+    user_id: Mapped[str] = mapped_column(String, index=True)
+    role: Mapped[str] = mapped_column(String)
+    content: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[float] = mapped_column(Float, default=time.time)
+
+class RevokedToken(Base):
+    __tablename__ = "revoked_tokens"
+    jti: Mapped[str] = mapped_column(String, primary_key=True)
+    expires_at: Mapped[float] = mapped_column(Float)
+
+class MediaAsset(Base):
+    __tablename__ = "media_assets"
+    filename: Mapped[str] = mapped_column(String, primary_key=True)
+    user_id: Mapped[str] = mapped_column(String, index=True)
+    media_type: Mapped[str] = mapped_column(String)
+    created_at: Mapped[float] = mapped_column(Float, default=time.time)
+
+class MovieJob(Base):
+    __tablename__ = "movie_jobs"
+    job_id: Mapped[str] = mapped_column(String, primary_key=True)
+    user_id: Mapped[str] = mapped_column(String, index=True)
+    topic: Mapped[str] = mapped_column(String)
+    status: Mapped[str] = mapped_column(String, default="pending")
+    progress: Mapped[int] = mapped_column(Integer, default=0)
+    message: Mapped[str] = mapped_column(String, nullable=True)
+    filename: Mapped[str] = mapped_column(String, nullable=True)
+    error: Mapped[str] = mapped_column(Text, nullable=True)
+    created_at: Mapped[float] = mapped_column(Float, default=time.time)
+
+async def get_db():
+    async with AsyncSessionLocal() as session: yield session
+
+async def init_db():
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+# ============ STORAGE ============
+_s3 = None
+def get_s3():
+    global _s3
+    if _s3 is None and R2_ENDPOINT_URL:
+        _s3 = boto3.client("s3", endpoint_url=R2_ENDPOINT_URL,
+            aws_access_key_id=R2_ACCESS_KEY_ID, aws_secret_access_key=R2_SECRET_ACCESS_KEY,
+            config=BotoConfig(signature_version="s3v4"), region_name="auto")
+    return _s3
+
+def upload_file(filepath, key, content_type="application/octet-stream"):
+    s3 = get_s3()
+    if s3:
+        s3.upload_file(filepath, R2_BUCKET_NAME, key, ExtraArgs={'ContentType': content_type})
+    return key
+
+def upload_bytes(data, key, content_type="application/octet-stream"):
+    s3 = get_s3()
+    if s3:
+        s3.put_object(Bucket=R2_BUCKET_NAME, Key=key, Body=data, ContentType=content_type)
+    return key
+
+def presigned_url(key, expires_in=3600):
+    s3 = get_s3()
+    if s3:
+        return s3.generate_presigned_url("get_object", Params={"Bucket": R2_BUCKET_NAME, "Key": key}, ExpiresIn=expires_in)
+    return f"/media/{key}"
+
+# ============ GEMINI & AUDIO ============
+gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
+
+async def gemini_chat_stream(history, message):
+    contents = []
+    for item in history:
+        role = "user" if item["role"] == "user" else "model"
+        contents.append({"role": role, "parts": [{"text": item["content"]}]})
+    contents.append({"role": "user", "parts": [{"text": message}]})
+    response = await gemini_client.aio.models.generate_content_stream(
+        model=CHAT_MODEL, contents=contents,
+        config=types.GenerateContentConfig(
+            system_instruction="You are ARGON AI, created by Kaushik Raj. Reply in user's language."
+        )
+    )
+    async for chunk in response:
+        if chunk.text: yield chunk.text
+
+async def gemini_image_bytes(prompt):
+    result = await gemini_client.aio.models.generate_content(
+        model=IMAGE_MODEL, contents=prompt,
+        config=types.GenerateContentConfig(response_modalities=["TEXT", "IMAGE"])
+    )
+    for cand in result.candidates or []:
+        for part in cand.content.parts:
+            if part.inline_data and part.inline_data.data:
+                return part.inline_data.data
+    raise RuntimeError("No image generated")
+
+async def synthesize_voice(text, voice="hi-IN-MadhurNeural"):
+    c = edge_tts.Communicate(text, voice)
+    buf = b""
+    async for chunk in c.stream():
+        if chunk["type"] == "audio": buf += chunk["data"]
+    return buf
+
+# ============ LIFESPAN ============
+@asynccontextmanager
+async def lifespan(app):
+    await init_db()
+    yield
+    await engine.dispose()
+
+app = FastAPI(title="ARGON AI V7000", lifespan=lifespan)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+
+# ============ FRONTEND DASHBOARD (PART 4 & 5) ============
+INDEX_HTML = """<!DOCTYPE html>
+<html lang="hi"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ARGON AI</title>
+<script src="https://cdn.jsdelivr.net/npm/marked@11.1.1/marked.min.js"></script>
+<style>
+:root{--bg:#0a0b10;--bg-2:#12141c;--bg-3:#1a1d28;--bg-4:#252936;--bd:#252936;--tx:#e8eaf0;--tx2:#8b8fa3;--ac:#7c9cff;--gd:linear-gradient(135deg,#7c9cff,#a855f7);--ub:#2a3050;--ab:#14171f}
+*{box-sizing:border-box;margin:0;padding:0}html,body{height:100%;overflow:hidden}
+body{font-family:sans-serif;background:var(--bg);color:var(--tx);display:flex}
+.sb{width:260px;background:var(--bg-2);border-right:1px solid var(--bd);display:flex;flex-direction:column;padding:16px 12px}
+.lg{font-weight:700;font-size:18px;background:var(--gd);-webkit-background-clip:text;-webkit-text-fill-color:transparent;margin-bottom:20px}
+.ni{display:flex;align-items:center;gap:10px;padding:10px;border-radius:8px;font-size:14px;color:var(--tx2);background:none;border:none;cursor:pointer;width:100%;text-align:left}
+.ni.active, .ni:hover{background:var(--bg-3);color:var(--tx)}
+.mn{flex:1;display:flex;flex-direction:column}
+.hd{height:60px;display:flex;align-items:center;padding:0 20px;border-bottom:1px solid var(--bd);background:var(--bg-2)}
+.ct{flex:1;overflow-y:auto;position:relative}
+.vw{display:none;height:100%;flex-direction:column}.vw.active{display:flex}
+.cs{flex:1;overflow-y:auto;padding:20px;display:flex;flex-direction:column;gap:12px}
+.mr{display:flex;gap:10px;max-width:85%}
+.mr.user{align-self:flex-end;flex-direction:row-reverse}
+.mr.ai{align-self:flex-start}
+.mbb{padding:12px 16px;border-radius:14px;font-size:14px;line-height:1.5}
+.mr.user .mbb{background:var(--ub)}
+.mr.ai .mbb{background:var(--ab);border:1px solid var(--bd)}
+.cw{padding:16px;background:var(--bg-2);border-top:1px solid var(--bd);display:flex;gap:10px}
+input, textarea{flex:1;background:var(--bg);border:1px solid var(--bd);color:#fff;padding:12px;border-radius:8px;outline:none}
+button.send-btn{background:var(--gd);color:#fff;border:none;padding:12px 20px;border-radius:8px;font-weight:600;cursor:pointer}
+</style></head><body>
+<aside class="sb">
+  <div class="lg">ARGON AI V7000</div>
+  <button class="ni active" onclick="switchTab('chat')">💬 चैट</button>
+  <button class="ni" onclick="switchTab('image')">🎨 इमेज जनरेटर</button>
+</aside>
+<div class="mn">
+  <div class="hd"><h3 id="tabTitle">ARGON चैट</h3></div>
+  <div class="ct">
+    <div class="vw active" id="vw-chat">
+      <div class="cs" id="chatArea">
+        <div class="mr ai"><div class="mbb">नमस्ते! मैं ARGON AI हूँ। आप मुझसे कोई भी सवाल पूछ सकते हैं।</div></div>
+      </div>
+      <div class="cw">
+        <input type="text" id="chatInput" placeholder="अपना सवाल लिखें..." onkeydown="if(event.key==='Enter')sendChat()">
+        <button class="send-btn" onclick="sendChat()">भेजें</button>
+      </div>
+    </div>
+    <div class="vw" id="vw-image" style="padding:20px;">
+      <textarea id="imgPrompt" rows="3" placeholder="इमेज का प्रॉम्प्ट लिखें..."></textarea>
+      <button class="send-btn" style="margin-top:10px;" onclick="genImg()">✨ इमेज बनाएं</button>
+      <div id="imgOut" style="margin-top:20px;"></div>
+    </div>
+  </div>
+</div>
+<script>
+function switchTab(t){
+  document.querySelectorAll('.vw').forEach(v=>v.classList.remove('active'));
+  document.querySelectorAll('.ni').forEach(n=>n.classList.remove('active'));
+  document.getElementById('vw-'+t).classList.add('active');
+  event.target.classList.add('active');
+  document.getElementById('tabTitle').innerText = t==='chat'?'ARGON चैट':'इमेज जनरेटर';
+}
+async function sendChat(){
+  const inp = document.getElementById('chatInput'), msg = inp.value.trim(), box = document.getElementById('chatArea');
+  if(!msg) return;
+  box.innerHTML += `<div class="mr user"><div class="mbb">${msg}</div></div>`;
+  inp.value = '';
+  box.scrollTop = box.scrollHeight;
+  const aiBox = document.createElement('div');
+  aiBox.className = 'mr ai';
+  aiBox.innerHTML = `<div class="mbb">⏳ सोच रहा हूँ...</div>`;
+  box.appendChild(aiBox);
+  box.scrollTop = box.scrollHeight;
+  try {
+    const res = await fetch('/api/chat', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({message:msg})});
+    const d = await res.json();
+    aiBox.querySelector('.mbb').innerHTML = marked.parse(d.answer || d.detail || 'कोई उत्तर नहीं मिला');
+  } catch(e) { aiBox.querySelector('.mbb').innerText = 'त्रुटि: ' + e.message; }
+  box.scrollTop = box.scrollHeight;
+}
+async function genImg(){
+  const p = document.getElementById('imgPrompt').value.trim(), out = document.getElementById('imgOut');
+  if(!p) return;
+  out.innerHTML = '⏳ इमेज बन रही है...';
+  try {
+    const res = await fetch('/api/image', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({prompt:p})});
+    const d = await res.json();
+    if(d.image_base64) out.innerHTML = `<img src="data:image/png;base64,${d.image_base64}" style="max-width:100%;border-radius:10px;">`;
+    else out.innerText = 'इमेज नहीं बन सकी: ' + JSON.stringify(d);
+  } catch(e) { out.innerText = 'त्रुटि: ' + e.message; }
+}
+</script>
+</body></html>"""
+
+class ChatIn(BaseModel): message: str
+class ImageIn(BaseModel): prompt: str
+
+@app.get("/", response_class=HTMLResponse)
+async def home(): return INDEX_HTML
+
+@app.post("/api/chat")
+async def chat_endpoint(data: ChatIn):
+    if not GEMINI_API_KEY:
+        raise HTTPException(500, "GEMINI_API_KEY सर्वर पर उपलब्ध नहीं है")
+    try:
+        res = gemini_client.models.generate_content(model=CHAT_MODEL, contents=data.message)
+        return {"answer": res.text}
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+@app.post("/api/image")
+async def image_endpoint(data: ImageIn):
+    if not GEMINI_API_KEY:
+        raise HTTPException(500, "GEMINI_API_KEY सर्वर पर उपलब्ध नहीं है")
+    try:
+        raw_bytes = await gemini_image_bytes(data.prompt)
+        return {"image_base64": base64.b64encode(raw_bytes).decode("utf-8")}
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", 8000)), reload=False)
+  
