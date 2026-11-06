@@ -1,5 +1,4 @@
-
-    import os, json, urllib.request, urllib.error
+import os, json, urllib.request, urllib.error
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -44,7 +43,6 @@ body {
   overflow: hidden;
 }
 
-/* Sidebar */
 .sidebar {
   width: 260px;
   background: var(--bg-surface);
@@ -86,7 +84,6 @@ body {
 .nav-btn:hover { background: var(--bg-surface-elevated); color: var(--text-primary); }
 .nav-btn.active { background: #004a77; color: #c2e7ff; }
 
-/* Main Wrapper */
 .main-wrapper {
   flex: 1;
   display: flex;
@@ -111,7 +108,7 @@ body {
   overflow-y: auto;
   display: none;
   flex-direction: column;
-  padding: 24px 20px 120px; /* नीचे इनपुट बॉक्स की जगह */
+  padding: 24px 20px 120px;
   max-width: 860px;
   width: 100%;
   margin: 0 auto;
@@ -119,7 +116,6 @@ body {
 
 .content-pane.active { display: flex; }
 
-/* Chat Container */
 .chat-container {
   display: flex;
   flex-direction: column;
@@ -144,7 +140,6 @@ body {
   color: #f0f0f0;
 }
 
-/* Chat Input Bar (नीचे बिल्कुल साफ़ दिखने वाला) */
 .chat-input-wrapper {
   position: absolute;
   bottom: 20px;
@@ -186,7 +181,6 @@ body {
   font-weight: bold;
 }
 
-/* Studio & Theater */
 .card-box {
   background: var(--bg-surface);
   border: 1px solid var(--border-subtle);
@@ -242,7 +236,6 @@ textarea {
   font-size: 14px;
 }
 
-/* Voice */
 .voice-area {
   display: flex;
   flex-direction: column;
@@ -289,7 +282,6 @@ textarea {
     <div>Architected by <b>Kaushik Raj</b></div>
   </div>
 
-  <!-- CHAT -->
   <div class="content-pane active" id="pane-chat">
     <div class="chat-container" id="chatArea">
       <div class="chat-row ai">
@@ -298,7 +290,6 @@ textarea {
     </div>
   </div>
 
-  <!-- IMAGE -->
   <div class="content-pane" id="pane-image">
     <div class="card-box">
       <h3>📷 8K अल्ट्रा-रियलिस्टिक फोटो लैब</h3>
@@ -310,7 +301,6 @@ textarea {
     </div>
   </div>
 
-  <!-- MOVIE -->
   <div class="content-pane" id="pane-movie">
     <div class="card-box">
       <h3>🎬 मूवी फैक्ट्री (दृश्य + आवाज़)</h3>
@@ -326,7 +316,6 @@ textarea {
     </div>
   </div>
 
-  <!-- VOICE -->
   <div class="content-pane" id="pane-voice">
     <div class="voice-area">
       <div class="voice-ball" id="voiceBall" onclick="startVoice()">🎙️</div>
@@ -335,7 +324,6 @@ textarea {
     </div>
   </div>
 
-  <!-- FLOATING INPUT BAR (सिर्फ चैट के लिए) -->
   <div class="chat-input-wrapper" id="chatBar">
     <input type="text" id="chatInput" placeholder="ARGON से कुछ भी पूछें..." onkeydown="if(event.key==='Enter')sendChat()">
     <button class="send-btn-circle" onclick="sendChat()">➔</button>
@@ -348,8 +336,6 @@ function switchTab(t) {
   document.querySelectorAll('.nav-btn').forEach(b => b.classList.remove('active'));
   document.getElementById('pane-' + t).classList.add('active');
   event.target.classList.add('active');
-  
-  // चैट बार केवल चैट टैब में दिखेगा
   document.getElementById('chatBar').style.display = (t === 'chat') ? 'flex' : 'none';
 }
 
@@ -507,7 +493,6 @@ def call_gemini_backend(prompt: str) -> str:
     if not key:
         return "GEMINI_API_KEY सेट नहीं है।"
     
-    # आपके cURL द्वारा प्रमाणित सटीक एंडपॉइंट
     url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent"
     
     payload = {
@@ -518,8 +503,6 @@ def call_gemini_backend(prompt: str) -> str:
         ]
     }
     data = json.dumps(payload).encode("utf-8")
-    
-    # cURL वाला X-goog-api-key हेडर (जो AQ वाली चाबी को स्वीकार करता है)
     headers = {
         "Content-Type": "application/json",
         "X-goog-api-key": key
